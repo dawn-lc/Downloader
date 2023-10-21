@@ -1,12 +1,37 @@
 ﻿using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Http.Headers;
 
 namespace Downloader
 {
     public struct Range
     {
-        public long Start { get; set; }
-        public long End { get; set; }
+        public long Start
+        {
+            readonly get => start;
+            set
+            {
+                if (value > end)
+                {
+                    throw new ArgumentException("The start is greater than the end", nameof(Start));
+                }
+                start = value;
+            }
+        }
+        private long start;
+        public long End
+        {
+            readonly get => end;
+            set
+            {
+                if (value < start)
+                {
+                    throw new ArgumentException("The end is smaller than the start", nameof(End));
+                }
+                end = value;
+            }
+        }
+        private long end;
         public readonly long Length 
         {
              get => End - Start;
@@ -43,16 +68,13 @@ namespace Downloader
             TaskHandler = task;
             Chunks = new ConcurrentDictionary<long, Chunk>();
             Length = TaskHandler.GetFileLength();
-            long chunks = (Length % TaskHandler.Option.ChunkSize) != 0 ? (Length / TaskHandler.Option.ChunkSize) + 1 : Length / TaskHandler.Option.ChunkSize;
-            if (chunks >= TaskHandler.Option.ParallelCount)
+            long chunks = TaskHandler.Option.ParallelCount < 2 || Length < 0 ? 1 : (Length % TaskHandler.Option.ChunkSize) != 0 ? (Length / TaskHandler.Option.ChunkSize) + 1 : Length / TaskHandler.Option.ChunkSize;
+            for (long i = 0; i < chunks; i++)
             {
-                for (long i = 0; i < chunks; i++)
-                {
-                    long start = i * TaskHandler.Option.ChunkSize;
-                    long end = i <= chunks ? start + TaskHandler.Option.ChunkSize : Length;
-                    Chunk chunk = new() { Range = new() { Start = start, End = end }, Completed = 0 };
-                    Chunks.AddOrUpdate(i, chunk, (key, oldValue) => chunk);
-                }
+                long start = i * TaskHandler.Option.ChunkSize;
+                long end = (i + 1) < chunks ? start + TaskHandler.Option.ChunkSize : Length;
+                Chunk chunk = new() { Range = new() { Start = start, End = end }, Completed = 0 };
+                Chunks.AddOrUpdate(i, chunk, (key, oldValue) => chunk);
             }
         }
 
@@ -182,7 +204,7 @@ namespace Downloader
         {
             return response.Headers.AcceptRanges.Contains("bytes") || response.Content.Headers.ContentRange != null;
         }
-        public long GetFileLength(HttpRequestMessage? httpRequest = null)
+        public long GetFileLength(HttpRequestMessage? httpRequest = null, int tryCount = 0)
         {
             Uri uri = new(Option.URL);
             HttpResponseMessage? httpResponse = null;
@@ -196,27 +218,44 @@ namespace Downloader
                 }
                 if (!IsSupportRange(httpResponse))
                 {
-                    throw new NotSupportedException("Not Supported Range");
+                    throw new NotSupportedException("Not supported range");
                 }
                 if (httpResponse.Content.Headers.ContentRange != null && httpResponse.Content.Headers.ContentRange.HasRange && httpResponse.Content.Headers.ContentRange.HasLength)
                 {
-                    return httpResponse.Content.Headers.ContentRange.Length ?? -1;
+                    return httpResponse.Content.Headers.ContentRange.Length ?? throw new Exception("Unable to get file length");
                 }
                 if (httpResponse.Content.Headers.ContentLength.HasValue)
                 {
                     return httpResponse.Content.Headers.ContentLength.Value;
                 }
-                return -1;
+                throw new Exception("Unable to get file length");
             }
             catch (HttpRequestException)
             {
-                httpRequest.Method = HttpMethod.Get;
-                httpRequest.Headers.Add("Range", "bytes=0-1");
-                return GetFileLength(httpRequest);
+                if (tryCount < 1)
+                {
+                    tryCount++;
+                    httpRequest = new(HttpMethod.Get, uri);
+                    httpRequest.Headers.Add("Range", "bytes=0-1");
+                    return GetFileLength(httpRequest, tryCount);
+                   
+                }
+                throw;
             }
             catch (Exception)
             {
-                return -1;
+                tryCount++;
+                if (tryCount < 5)
+                {
+                    HttpRequestHeaders Headers = httpRequest.Headers;
+                    httpRequest = new(httpRequest.Method, uri);
+                    foreach (var item in Headers)
+                    {
+                        httpRequest.Headers.Add(item.Key, item.Value);
+                    }
+                    return GetFileLength(httpRequest, tryCount);
+                }
+                throw;
             }
             finally
             {
