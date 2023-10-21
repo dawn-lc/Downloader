@@ -1,5 +1,4 @@
-﻿using LiteDB;
-using System.Collections.Concurrent;
+﻿using System.Collections.Concurrent;
 using System.Net;
 
 namespace Downloader
@@ -8,6 +7,19 @@ namespace Downloader
     {
         public long Start { get; set; }
         public long End { get; set; }
+        public readonly long Length 
+        {
+             get => End - Start;
+        }
+    }
+    public struct Chunk
+    {
+        public readonly bool IsCompleted 
+        {
+            get => Completed == Range.Length;
+        }
+        public Range Range { get; set; }
+        public long Completed { get; set; }
     }
     public struct Option
     {
@@ -24,31 +36,43 @@ namespace Downloader
     {
         public Task TaskHandler { get; }
         public long Length { get; }
-        public ConcurrentDictionary<int,Range> Ranges { get; private set; }
+        public ConcurrentDictionary<long, Chunk> Chunks { get; }
 
         public Progress(Task task)
         {
             TaskHandler = task;
-            Ranges = new ConcurrentDictionary<int, Range>(Enumerable.Range(0, TaskHandler.Option.ParallelCount).ToDictionary(i => i, i => new Range()));
+            Chunks = new ConcurrentDictionary<long, Chunk>();
             Length = TaskHandler.GetFileLength();
+            long chunks = (Length % TaskHandler.Option.ChunkSize) != 0 ? (Length / TaskHandler.Option.ChunkSize) + 1 : Length / TaskHandler.Option.ChunkSize;
+            if (chunks >= TaskHandler.Option.ParallelCount)
+            {
+                for (long i = 0; i < chunks; i++)
+                {
+                    long start = i * TaskHandler.Option.ChunkSize;
+                    long end = i <= chunks ? start + TaskHandler.Option.ChunkSize : Length;
+                    Chunk chunk = new() { Range = new() { Start = start, End = end }, Completed = 0 };
+                    Chunks.AddOrUpdate(i, chunk, (key, oldValue) => chunk);
+                }
+            }
         }
+
         public double Value
         {
-            get => (double)Ranges.Sum(item => item.Value.End - item.Value.Start) / Length;
+            get => (double)Chunks.Sum(item => item.Value.Completed) / Length;
         }
-        public void Set(int id, Range range)
+
+        public void Set(long id, Chunk chunk)
         {
-            Ranges.AddOrUpdate(id, range, (key, oldValue) => range);
+            Chunks.TryUpdate(id, chunk, chunk);
             TaskHandler.OnTaskProgressChanged(Value);
         }
-        public Range Get(int id)
+        public Chunk Get(long id)
         {
-            if (!Ranges.TryGetValue(id, out Range range))
+            if (!Chunks.TryGetValue(id, out Chunk chunk))
             {
-                range = Ranges.AddOrUpdate(id, new Range(), (key, oldValue) => new Range());
-                TaskHandler.OnTaskProgressChanged(Value);
+                throw new InvalidOperationException();
             }
-            return range;
+            return chunk;
         }
     }
 
@@ -56,26 +80,6 @@ namespace Downloader
     public class Task : IDisposable
     {
         private bool disposedValue;
-
-        /// <summary>
-        /// ID
-        /// </summary>
-        public ObjectId ID
-        {
-            get
-            {
-                id ??= ObjectId.NewObjectId();
-                return id;
-            }
-            set
-            {
-                if (value != id)
-                {
-                    id = value;
-                }
-            }
-        }
-        private ObjectId? id;
 
         private ITaskState? state;
         public ITaskState State
@@ -129,8 +133,6 @@ namespace Downloader
             return State;
         }
 
-        
-
 
         public event Action<double>? TaskProgressChanged;
         public event Action<ITaskState>? TaskStateChanged;
@@ -176,6 +178,10 @@ namespace Downloader
             }
             Progress = new(this);
         }
+        public static bool IsSupportRange(HttpResponseMessage response)
+        {
+            return response.Headers.AcceptRanges.Contains("bytes") || response.Content.Headers.ContentRange != null;
+        }
         public long GetFileLength(HttpRequestMessage? httpRequest = null)
         {
             Uri uri = new(Option.URL);
@@ -187,6 +193,10 @@ namespace Downloader
                 if (!httpResponse.IsSuccessStatusCode)
                 {
                     throw new HttpRequestException();
+                }
+                if (!IsSupportRange(httpResponse))
+                {
+                    throw new NotSupportedException("Not Supported Range");
                 }
                 if (httpResponse.Content.Headers.ContentRange != null && httpResponse.Content.Headers.ContentRange.HasRange && httpResponse.Content.Headers.ContentRange.HasLength)
                 {
@@ -211,6 +221,47 @@ namespace Downloader
             finally
             {
                 httpResponse?.Dispose();
+            }
+        }
+
+        public async void Chunk(long id, int tryCount)
+        {
+            Chunk chunk = Progress.Get(id);
+            Uri uri = new(Option.URL);
+            HttpRequestMessage request = new(HttpMethod.Get, uri);
+            request.Headers.Add("Range", $"bytes={chunk.Range.Start}-{chunk.Range.End}");
+            long chunkSeek = chunk.Range.Start;
+            try
+            {
+                Stream ResponseStream = await (await ClientHandler.SendAsync(request)).Content.ReadAsStreamAsync();
+                byte[] buffer = new byte[Option.ChunkSize];
+
+                int bytesRead;
+                using (FileStream destination = new(Option.Path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Write))
+                {
+                    while ((bytesRead = await ResponseStream.ReadAsync(buffer)) != 0)
+                    {
+                        destination.Seek(chunkSeek, SeekOrigin.Begin);
+                        await destination.WriteAsync(buffer.AsMemory(0, bytesRead));
+                        buffer.Initialize();
+                        chunkSeek = destination.Position;
+                        chunk.Completed += bytesRead;
+                        Progress.Set(id, chunk);
+                    }
+                };
+            }
+            catch (Exception ex) when (ex is HttpRequestException || ex is IOException)
+            {
+                if (tryCount < 5)
+                {
+                    tryCount++;
+                    await System.Threading.Tasks.Task.Delay(1000 * 5);
+                    Chunk(id, tryCount);
+                }
+                else
+                {
+                    throw;
+                }
             }
         }
 
