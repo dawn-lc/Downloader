@@ -1,6 +1,12 @@
-﻿using System.Collections.Concurrent;
+﻿using System;
+using System.Buffers;
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Threading;
 
 namespace Downloader
 {
@@ -32,22 +38,104 @@ namespace Downloader
             }
         }
         private long end;
-        public readonly long Length 
+        public readonly int Length 
         {
-             get => End - Start;
+            get
+            {
+                try
+                {
+                    return checked((int)(End - Start));
+                }
+                catch (OverflowException)
+                {
+                    return int.MaxValue;
+                }
+            }
+        }
+        
+    }
+
+    public class ChunkQueue
+    {
+        public int Length { get => Chunks.Length; }
+        public Chunk[] Chunks { get; private set; }
+        private object ChunksLock = new();
+        public ChunkQueue(Chunk[] chunks)
+        {
+            Chunks = chunks;
+        }
+        public ChunkQueue(long fileLength, long chunkSize)
+        {
+            long length = (fileLength < 0 ? 1 : (fileLength % chunkSize) != 0 ? (fileLength / chunkSize) + 1 : fileLength / chunkSize);
+            Chunks = new Chunk[length];
+            for (int i = 0; i < length; i++)
+            {
+                long start = i * chunkSize;
+                long end = (i + 1) < length ? start + chunkSize : fileLength;
+                Chunks[i] = new(new() { Start = start, End = end });
+            }
+        }
+        public bool Dequeue(out Chunk? chunk)
+        {
+            lock (ChunksLock)
+            {
+                int index = Array.FindIndex(Chunks, i => i.State == State.Waiting);
+                chunk = index >= 0 ? Chunks[index] : null;
+                return chunk != null;
+            }
         }
     }
-    public struct Chunk
+    public enum State
     {
-        public readonly bool IsCompleted 
+        Waiting,
+        Downloading,
+        Completed
+    }
+    public class Chunk
+    {
+        public event Action<double>? ChunkProgressChanged;
+        public event Action<State>? ChunkStateChanged;
+
+        private long completed;
+        public long Completed
         {
-            get => Completed == Range.Length;
+            get => completed;
+            set
+            {
+                completed = value;
+                ChunkProgressChanged?.Invoke((double)completed / Range.Length);
+                State = completed >= Range.Length ? State.Completed : State.Downloading;
+            }
         }
+
+        private State state;
+        public State State
+        {
+            get => state;
+            set
+            {
+                if (state != value)
+                {
+                    state = value;
+                    ChunkStateChanged?.Invoke(state);
+                }
+            }
+        }
+
         public Range Range { get; set; }
-        public long Completed { get; set; }
+
+        public Chunk(Range range, long completed = 0)
+        {
+            Range = range;
+            Completed = completed;
+            State = State.Waiting;
+        }
     }
+
     public struct Option
-    {
+    { 
+        public int Attempts { get; set; }
+        public int Delay { get; set; }
         public string Path { get; set; }
         public string URL { get; set; }
         public int ParallelCount { get; set; }
@@ -59,47 +147,25 @@ namespace Downloader
 
     public class Progress
     {
-        public Task TaskHandler { get; }
+        public DownloadTask TaskHandler { get; }
         public long Length { get; }
-        public ConcurrentDictionary<long, Chunk> Chunks { get; }
+        public ChunkQueue ChunkQueue { get; }
 
-        public Progress(Task task)
+        public Progress(DownloadTask task)
         {
             TaskHandler = task;
-            Chunks = new ConcurrentDictionary<long, Chunk>();
             Length = TaskHandler.GetFileLength();
-            long chunks = TaskHandler.Option.ParallelCount < 2 || Length < 0 ? 1 : (Length % TaskHandler.Option.ChunkSize) != 0 ? (Length / TaskHandler.Option.ChunkSize) + 1 : Length / TaskHandler.Option.ChunkSize;
-            for (long i = 0; i < chunks; i++)
-            {
-                long start = i * TaskHandler.Option.ChunkSize;
-                long end = (i + 1) < chunks ? start + TaskHandler.Option.ChunkSize : Length;
-                Chunk chunk = new() { Range = new() { Start = start, End = end }, Completed = 0 };
-                Chunks.AddOrUpdate(i, chunk, (key, oldValue) => chunk);
-            }
+            ChunkQueue = new(Length, TaskHandler.Option.ChunkSize);
         }
 
         public double Value
         {
-            get => (double)Chunks.Sum(item => item.Value.Completed) / Length;
-        }
-
-        public void Set(long id, Chunk chunk)
-        {
-            Chunks.TryUpdate(id, chunk, chunk);
-            TaskHandler.OnTaskProgressChanged(Value);
-        }
-        public Chunk Get(long id)
-        {
-            if (!Chunks.TryGetValue(id, out Chunk chunk))
-            {
-                throw new InvalidOperationException();
-            }
-            return chunk;
+            get => (double)ChunkQueue.Chunks.Sum(item => item.Completed) / Length;
         }
     }
 
 
-    public class Task : IDisposable
+    public class DownloadTask : IDisposable
     {
         private bool disposedValue;
 
@@ -167,13 +233,14 @@ namespace Downloader
             TaskStateChanged?.Invoke(State);
         }
 
-
+        
         private SocketsHttpHandler SocketsHandler { get; set; }
         private HttpClient ClientHandler { get; set; }
+        public CancellationTokenSource CancellationTokenSource { get; set; }
         public Progress Progress { get; set; }
         public Option Option { get; }
 
-        public Task(Option option)
+        public DownloadTask(Option option)
         {
             Option = option;
             started = new TaskStarted(this);
@@ -199,6 +266,11 @@ namespace Downloader
                 ClientHandler.DefaultRequestHeaders.Add("cookie", Option.Cookies);
             }
             Progress = new(this);
+            CancellationTokenSource = new();
+            using (FileStream destination = new(Option.Path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Write))
+            {
+
+            }
         }
         public static bool IsSupportRange(HttpResponseMessage response)
         {
@@ -238,7 +310,6 @@ namespace Downloader
                     httpRequest = new(HttpMethod.Get, uri);
                     httpRequest.Headers.Add("Range", "bytes=0-1");
                     return GetFileLength(httpRequest, tryCount);
-                   
                 }
                 throw;
             }
@@ -262,45 +333,47 @@ namespace Downloader
                 httpResponse?.Dispose();
             }
         }
-
-        public async void Chunk(long id, int tryCount)
+        public async Task Download(Chunk chunk, CancellationToken? cancellationToken = null)
         {
-            Chunk chunk = Progress.Get(id);
-            Uri uri = new(Option.URL);
-            HttpRequestMessage request = new(HttpMethod.Get, uri);
-            request.Headers.Add("Range", $"bytes={chunk.Range.Start}-{chunk.Range.End}");
-            long chunkSeek = chunk.Range.Start;
-            try
+            CancellationToken ct = cancellationToken ?? CancellationToken.None;
+            using (IMemoryOwner<byte> bufferOwner = MemoryPool<byte>.Shared.Rent(chunk.Range.Length))
             {
-                Stream ResponseStream = await (await ClientHandler.SendAsync(request)).Content.ReadAsStreamAsync();
-                byte[] buffer = new byte[Option.ChunkSize];
-
-                int bytesRead;
-                using (FileStream destination = new(Option.Path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Write))
+                for (int tryCount = 0; tryCount < Option.Attempts; tryCount++)
                 {
-                    while ((bytesRead = await ResponseStream.ReadAsync(buffer)) != 0)
+                    try
                     {
-                        destination.Seek(chunkSeek, SeekOrigin.Begin);
-                        await destination.WriteAsync(buffer.AsMemory(0, bytesRead));
-                        buffer.Initialize();
-                        chunkSeek = destination.Position;
-                        chunk.Completed += bytesRead;
-                        Progress.Set(id, chunk);
+                        HttpRequestMessage request = new(HttpMethod.Get, Option.URL);
+                        request.Headers.Add("Range", $"bytes={chunk.Range.Start}-{chunk.Range.End}");
+                        using var response = await ClientHandler.SendAsync(request, ct);
+                        using var responseStream = await response.Content.ReadAsStreamAsync(ct);
+
+                        var buffer = bufferOwner.Memory;
+                        int bytesRead;
+                        int offset = 0;
+
+                        while ((bytesRead = await responseStream.ReadAsync(buffer.Slice(offset, chunk.Range.Length - offset), ct)) != 0)
+                        {
+                            offset += bytesRead;
+                            chunk.Completed += bytesRead;
+                            ct.ThrowIfCancellationRequested();
+                        }
+                        using (FileStream destination = new(Option.Path, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Write))
+                        {
+                            await destination.WriteAsync(buffer.Slice(0, offset));
+                        }
+                        return;
                     }
-                };
-            }
-            catch (Exception ex) when (ex is HttpRequestException || ex is IOException)
-            {
-                if (tryCount < 5)
-                {
-                    tryCount++;
-                    await System.Threading.Tasks.Task.Delay(1000 * 5);
-                    Chunk(id, tryCount);
+                    catch (Exception ex) when (ex is HttpRequestException || ex is IOException)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        if (tryCount >= (Option.Attempts - 1))
+                        {
+                            throw new Exception($"Failed to download chunk after {tryCount} attempts", ex);
+                        }
+                        await Task.Delay(Option.Delay);
+                    }
                 }
-                else
-                {
-                    throw;
-                }
+                throw new Exception($"Failed to download chunk after {Option.Attempts} attempts");
             }
         }
 

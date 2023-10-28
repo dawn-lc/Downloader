@@ -24,18 +24,19 @@
 
     public class TaskStarted : ITaskState
     {
-        private Task TaskHandler { get; set; }
-        public TaskStarted(Task taskHandler)
+        private DownloadTask TaskHandler { get; set; }
+        public TaskStarted(DownloadTask taskHandler)
         {
             TaskHandler = taskHandler;
         }
         public void Start()
         {
-
         }
 
         public void Stop()
         {
+
+            TaskHandler.CancellationTokenSource.Cancel();
             TaskHandler.State = TaskHandler.Stopped;
             TaskHandler.OnTaskStateChanged();
         }
@@ -55,14 +56,14 @@
 
     public class TaskStoped : ITaskState
     {
-        private Task TaskHandler { get; set; }
-        public TaskStoped(Task taskHandler)
+        private DownloadTask TaskHandler { get; set; }
+        public TaskStoped(DownloadTask taskHandler)
         {
             TaskHandler = taskHandler;
         }
         public void Start()
         {
-
+            
             TaskHandler.State = TaskHandler.Started;
         }
 
@@ -85,8 +86,8 @@
 
     public class TaskCompleted : ITaskState
     {
-        private Task TaskHandler { get; set; }
-        public TaskCompleted(Task taskHandler)
+        private DownloadTask TaskHandler { get; set; }
+        public TaskCompleted(DownloadTask taskHandler)
         {
             TaskHandler = taskHandler;
         }
@@ -109,8 +110,8 @@
 
     public class TaskFailed : ITaskState
     {
-        private Task TaskHandler { get; set; }
-        public TaskFailed(Task taskHandler)
+        private DownloadTask TaskHandler { get; set; }
+        public TaskFailed(DownloadTask taskHandler)
         {
             TaskHandler = taskHandler;
         }
